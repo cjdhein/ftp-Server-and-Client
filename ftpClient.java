@@ -151,7 +151,12 @@ public class ftpClient{
 				if(serverResponse.equals("accept")){ //server accepted and will open data connection
 					System.out.println("Sending command");
 					Socket dataSocket = establishDataConnection(hostName, dataPort);
-					
+		
+		//https://www.mkyong.com/java/how-to-convert-inputstream-to-file-in-java/
+		
+				}else{
+					System.out.println(serverResponse);
+					System.exit(1);
 				}
 			}
 			
