@@ -1,35 +1,332 @@
-/* 	Program: 	ftpServer
-**	By:			Cody J Dhein
-**	For:		CS372 Project 2
-**	Sources:	Much help and guidance from Beej's guide
-**					http://beej.us/guide/bgnet/output/html/singlepage/bgnet.html
-*/
+#include "ftpServer.h"
 
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <errno.h>
-#include <string.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netdb.h>
-#include <arpa/inet.h>
-#include <sys/wait.h>
-#include <signal.h>
-#include <dirent.h>
+void validateArguments(int argc, char *argv[]){
+	if (argc != 2) {
+		fprintf(stderr, "\nInvalid number of arguments provided. Expected usage: ftpServer PORT\n\n");
+		exit(1);		
+	}
+	
+	if(*argv[1] > 65535){
+		fprintf(stderr, "\nInvalid PORT provided.\n\n");
+		exit(1);				
+	}	
+}
 
-void sigchld_handler(int s);
-int startServer(char portNum[6]);
-int runServer(int listen_socket, int control_socket);
-void receiveCommand(int *control);
-bool fileExists(char *filename[], int filenameSize);
-void listDirectory(char dataPort[6], int *control);
-void sendFile(char dataPort[6], char fileName[128]);
+int openSocket(char portNum[6]){
+	int newSocket;
+	struct addrinfo hints, *results, *attempt;
+	struct sigaction sa;
+	int statusCheck;
+	
+	//initialize hints
+	memset(&hints, 0, sizeof hints);
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_flags = AI_PASSIVE;
+	
+	//setup structures for attempt
+	if((statusCheck = getaddrinfo(NULL, portNum, &hints, %results)) != 0){ //0 is success
+		fprintf(stderr, "getaddrinfo error: %s\n", gai_strerror(statusCheck));
+		exit(1);
+	}
+	
+	//loop through results to attempt bind. failure at any step jumps to next result
+	for(attempt = results; attempt != NULL; attempt = attempt->ai_next){
+		
+		//assign socket descriptor
+		if((newSocket = socket(attempt->ai_family, attempt->ai_socktype, attempt->ai_protocol)) == -1){
+			perror("server: socket");
+			continue;
+		}
+		
+		//establish socket's options
+		if(setsockopt(newSocket, SOL_SOCKET, SO_REUSEADDR, 1, sizeof(int)) == -1){
+			perror("server: setsockopt");
+			continue;
+		}
+		
+		//attempt to bind socket
+		if(bind(newSocket, attempt->ai_addr, attempt->ai_addrlen) == -1){
+			close(newSocket);
+			perror("server: bind");
+			continue;
+		}
+	
+		break;
+	}
+	
+	freeaddrinfo(results); //not needed anymore
+	
+	//check if socket bound successfully
+	if(attempt == NULL){
+		fprintf(stderr, "server: failed to bind\n");
+		exit(1);
+	}
+	
+	//start listening for connections
+	if(listen(newSocket, 10) != 0){
+		perror("listen");
+		exit(1);
+	}
+	
+	//clean up possible zombies
+	sa.sa_handler = sigchld_handler; 
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = SA_RESTART;
+	if(sigaction(SIGCHLD, &sa, NULL) != 0){
+		perror("sigaction");
+		exit(1);
+	}
+	
+	return newSocket;
+}
+
+void runFTP(int controlListener){
+	int controlSocket;
+	struct sockaddr_storage client_addr;
+	socklen_t sin_size;
+	
+	//Loop to keep server listening for connections even after client disconnect
+	while(1){
+		sin_size = sizeof client_addr;
+		
+		//accept connection and assign to controlSocket
+		controlSocket = accept(controlListener, (struct sockaddr *)&client_addr, &sin_size);
+		
+		if(controlSocket == -1){
+			perror("accept");
+			continue;
+		}
+		
+		printf("Server: client connected and control connection established\n");
+		
+		
+		//copied from Beej's guide
+		if(!fork()){
+			close(controlListener); //child process does not need the listener
+			
+			//call receiveCommand (this handles the subsequent calls to send a file or directory list)
+			receiveCommand(&controlSocket);
+			
+			//close control socket as this client has finished with server
+			close(controlSocket);
+		}
+		
+		close(controlSocket); //parent has no need for this
+	}
+}
+
+void receiveCommand(int *controlConnection){
+	
+	//used to send to client to inform of command acceptance or refusal. Only refuse is printed.
+	const char accept[] = "accept\n";
+	const char refuse[] = "Unknown command received. Expected '-l' or '-g <filename>'\n";
+	
+	char clientRequest[512]; //will hold entire client request
+	char dataPort[6]; //will hold dataPort from client
+	char command[2]; //will hold 2 digit client command ('-l' or '-g')
+	char filename[128]; //will hold filename if client sends -g
+	
+	//set character strings to 0
+	memset(&clientRequest, 0, sizeof clientRequest);
+	memset(&dataPort, 0, sizeof dataPort);
+	memset(&command, 0, sizeof command);
+	memset(&filename, 0, sizeof filename);	
+	
+	printf("Server: receiving command line\n");	
+	//receive from client and store into clientRequest
+	recv(*controlConnection, &clientRequest, sizeof clientRequest, 0);
+	
+	/*parse out elements from clientRequest and assign to applicable variables
+		filename will not be read unless -g is received*/
+	char *temp;
+	temp = strtok(clientRequest," \n");
+	strcpy(dataPort, temp);
+	temp = strtok(NULL, "  \n");
+	strcpy(command, temp);
+		
+	
+	//branch based on command type received.
+	if(strncmp(command,"-g",2) == 0) {//received getFile command
+		//read filename from request
+		temp = strtok(NULL, " \n");
+		strcpy(filename, temp);
+		
+		if(strncmp(filename, "",1) == 0){ //no filename provided
+			send(*controlConnection, &refuse, sizeof refuse, 0);
+		}
+		
+		//notify client command was accepted
+		send(*controlConnection, &accept, sizeof accept, 0);
+		
+		//call sendFile to handle the rest
+		sendFile(controlConnection, dataPort, filename);
+		
+	}else if(strncmp(command, "-l", 2) == 0){ //received getDirectory command
+		strcpy(filename,""); //set to empty as not needed
+		
+		//notify client command was accepted
+		send(*controlConnection, &accept, sizeof accept, 0);		
+		
+		sendDirectory(dataPort);
+	}else{ //invalid command received
+		send(*controlConnection, &refuse, sizeof refuse, 0);
+	}
+}
 
 
-//from Beej's Guide to clean up 'zombie' child processes
+//	directory opening / listen sourced from: 
+//	https://www.gnu.org/savannah-checkouts/gnu/libc/manual/html_node/Simple-Directory-Lister.html
+void sendDirectory(char dataPort[6]){
+	
+	char dirList[512]; //to hold directory listing
+	memset(&dirList, 0, sizeof dirList);
+	
+	/***************************************
+		Open Directory and Read into dirList
+	****************************************/
+	DIR *dp; //directory pointer
+	struct dirent *ep;
+	
+	dp = opendir("./"); //open directory this file is in
+	if(dp != NULL){
+		strcat(dirList, "Directory Listing: \n");
+		while(ep = readdir(dp)){	//print each file's name and go to new line
+			strcat(dirList, ep->d_name);
+			strcat(dirList, "\n");
+		}
+		strcat(dirList, "\nEnd of directory listing.\n");
+		(void) closedir (dp);
+	}else{
+		perror("Couldn't open directory");
+	}
+	
+	/***************************************
+		Open data connection and send dirList
+	****************************************/
+	int dataListener = openSocket(dataPort);
+	int dataConnection;
+	struct sockaddr_storage client_addr;
+	socklen_t sin_size;
+	
+	bool dataSent = false;
+	
+	//accept incoming connection
+	while(!dataSent){
+		sin_size = sizeof client_addr;
+		dataConnection = accept(dataListener, (struct sockaddr *)&client_addr, &sin_size);
+		
+		if(dataConnection ==-1){
+			perror("accept");
+			continue;
+		}		
+		if(!fork()){
+			close(dataListener);
+			
+			if(send(dataConnection, dirList, sizeof dirList, 0) != 0){
+				perror("send");
+			}
+			dataSent = true;
+			close(dataConnection);
+		}
+	}
+	
+	close(dataConnection);
+	close(dataListener);
+	return;
+
+}
+
+// http://www.cplusplus.com/reference/cstdio/fread/
+void sendFile(int *controlConnection, char dataPort[6], char fileName[128]){
+	char noFile[] = "File not found / invalid file name.";
+	bool fileSent = false;
+
+	/***************************************
+					Open File 
+	****************************************/
+	FILE *fp;	
+	
+	fp = fopen(fileName, "r");
+	
+	if (fp == NULL){
+		printf("Can't open file %s", fileName);
+		send(controlConnection, &noFile, sizeof noFile, 0);
+		exit(1);
+	}
+
+	/***************************************
+		Allocate buffer and read file in
+	****************************************/	
+	long fileSize;
+	char * buffer;
+	size_t result;
+
+	//allocate buffer
+	buffer = (char*) malloc (sizeof(char)*fileSize);
+	if(buffer == NULL){
+		fprintf(stderr, "Error allocating buffer.");
+		exit(1);
+	}
+	
+	//read file into buffer
+	result = fread(buffer, 1, fileSize, fp);
+	if(result != fileSize){
+		fprintf(stderr, "Error reading file into buffer.");
+		exit(1);		
+	}
+	
+	/*****************************************
+		Open data connection, and send file
+	*****************************************/
+	//open socket for data connection and accept
+	int dataListener = startServer(dataPort);
+	int dataConnection;
+	struct sockaddr_storage client_addr;
+	socklen_t sin_size;	
+	
+	printf("Server: attempting to establish data connection on port %s\n", dataPort);
+	//main listen loop
+	while(!fileSent) {
+		sin_size = sizeof client_addr;
+		dataConnection = accept(dataListener, (struct sockaddr *)&client_addr, &sin_size);
+
+		if(dataConnection == -1){
+			perror("accept");
+			continue;
+		}
+		
+		printf("Server: data connection established. Sending data...\n");
+		if(!fork()){
+			close(dataListener);
+			
+			//send the buffer to client
+			int bytesSent = 0;
+			int len = strlen(buffer);			
+			int bytesLeft = len;
+			int n;
+
+			
+			while(byteSent < len){
+				n = send(dataConnection, buffer, sizeof buffer,0);
+				if(bytesSent == -1){
+					break;
+				}
+				bytesSent += n;
+				bytesLeft -= n;
+			}
+			
+			close(dataConnection);
+			exit(0);
+		}
+		close(dataConnection);
+		close(dataListener);			
+		return;
+	}	
+
+}
+
 void sigchld_handler(int s)
 {
     // waitpid() might overwrite errno, so we save and restore it:
@@ -39,305 +336,3 @@ void sigchld_handler(int s)
 
     errno = saved_errno;
 }
-
-
-
-int startServer(char portNum[6]){
-	int serverSocket;
-	struct addrinfo hints, *results, *attempt;	
-	struct sigaction sa;
-	int yes=1;
-	int status_check;	
-	
-	//initialize hints
-	memset(&hints, 0, sizeof hints);
-	hints.ai_family = AF_INET;
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_flags = AI_PASSIVE;
-	
-	//get potential 
-	if((status_check = getaddrinfo(NULL,portNum, &hints, &results)) != 0){ //0 is success
-		fprintf(stderr, "getaddrinfo: %s\n",gai_strerror(status_check));
-		return 1;
-	}
-	
-	//check results and bind to first possible
-	for(attempt = results; attempt != NULL; attempt = attempt->ai_next){
-		
-			//allocate socket descriptor
-		if((serverSocket = socket(attempt->ai_family, attempt->ai_socktype, attempt->ai_protocol)) == -1){
-			perror("server: socket");
-			continue;
-		}
-		
-			//establish socket options
-		if(setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1){
-			perror("setsockopt");
-			exit(1);
-		}
-			//attempt to bind socket to IP/PORT
-		if(bind(serverSocket, attempt->ai_addr, attempt->ai_addrlen) == -1) {
-			close(serverSocket);
-			perror("server: bind");
-			continue;
-		}
-		
-		break;
-	}
-	
-	freeaddrinfo(results);
-	
-	if(attempt == NULL){
-		fprintf(stderr, "server: failed to bind\n");
-		exit(1);
-	}
-	
-	//start listening for connections
-	if(listen(serverSocket, 10) != 0){
-		perror("listen");
-		exit(1);
-	}
-	
-	//reap zombies
-	sa.sa_handler = sigchld_handler; 
-	sigemptyset(&sa.sa_mask);
-	sa.sa_flags = SA_RESTART;
-	if(sigaction(SIGCHLD, &sa, NULL) != 0){
-		perror("sigaction");
-		exit(1);
-	}
-	
-	printf("ftpServer is waiting for connections on port %s\n", portNum);	
-	return serverSocket;
-
-}
-
-int runServer(int listen_socket, int control_socket){
-	struct sockaddr_storage client_addr;
-	socklen_t sin_size;	
-	//main listen loop
-	while(1) {
-		sin_size = sizeof client_addr;
-		control_socket = accept(listen_socket, (struct sockaddr *)&client_addr, &sin_size);
-		
-		if(control_socket == -1){
-			
-			perror("accept");
-			continue;
-		}
-		
-		printf("Server: client connected and control connection established\n");
-		
-		if(!fork()){
-			close(listen_socket);
-			
-			receiveCommand(&control_socket);
-
-			close(control_socket);
-			exit(0);
-		}
-		close(control_socket);
-				
-	}
-	return 0;
-}
-
-
-
-void receiveCommand(int *control){
-	const char error[] = "Invalid command passed. Expected -l or -g <filename>";
-	const char accept[]= "accept\n";
-	char fromClient[512];
-	char dataPort[6];
-	char command[2];
-	char filename[128];
-	
-	memset(&fromClient, 0, sizeof fromClient);
-	memset(&dataPort, 0, sizeof dataPort);
-	memset(&command, 0, sizeof command);
-	memset(&filename, 0, sizeof filename);
-
-	printf("Server: receiving command line\n");	
-	recv(*control, &fromClient, sizeof fromClient, 0);
-	char * temp;
-	temp = strtok(fromClient," \n");
-	strcpy(dataPort, temp);
-	temp = strtok(NULL, "  \n");
-	strcpy(command, temp);
-	
-	if(strncmp(command,"-g",2) == 0){
-		temp = strtok(NULL, " \n");
-		strcpy(filename, temp);		
-		
-		int filenameSize = strlen(filename);
-		//send accept message
-		send(*control, &accept, sizeof accept, 0);
-		
-		printf("Command received: %s\nDataport: %s\nFilename: %s\nFilenameSize: %d", command, dataPort, filename, filenameSize);
-		
-		sendFile(dataPort, filename);
-		
-	}else if(strncmp(command,"-l",2) == 0){
-		printf("Server: sending accept\n");	
-		
-	
-		
-		printf("Command received: %s\nDataport: %s\n", command, dataPort);
-		
-		listDirectory(dataPort, control);
-	}else{
-		//send error message
-		send(*control, &error, sizeof error, 0);
-	}	
-}
-
-void listDirectory(char dataPort[6], int *control){
-	DIR *dp;
-	struct dirent *ep;
-	char dirList[512];
-	memset(&dirList, 0, sizeof dirList);
-	const char acceptString[]= "accept\n";
-	
-	dp = opendir("./");
-	if(dp != NULL){
-		strcat(dirList, "Directory Listing:\n\n");
-		while (ep = readdir(dp)){
-			strcat(dirList, ep->d_name);
-			strcat(dirList, "\n");
-		}
-		strcat(dirList, "\n\nEnd of directory listing.\n");	
-		(void) closedir (dp);
-	}else{
-		perror("Couldn't open directory");
-	}
-	printf("\nattempting send\n");
-	/* TODO: Actually send the listing*/
-	
-	//open socket for data connection and accept
-	int data_listener = startServer(dataPort);
-	int data_socket;
-	struct sockaddr_storage client_addr;
-	socklen_t sin_size;	
-	
-	printf("Server: attempting to establish data connection on port %s\n", dataPort);
-	
-	//send accept message
-	send(*control, &acceptString, sizeof acceptString, 0);		
-	
-	//main listen loop
-	while(1) {
-		printf("danger\n");
-		sin_size = sizeof client_addr;
-		printf("danger\n");
-		data_socket = accept(data_listener, (struct sockaddr *)&client_addr, &sin_size);
-		printf("danger\n");
-		if(data_socket == -1){
-			perror("accept");
-			continue;
-		}
-		
-		printf("Server: data connection established. Sending data...\n");
-
-		if(!fork()){
-			close(data_listener);
-
-		if(send(data_socket, dirList, sizeof dirList, 0) != 0)
-			perror("send");
-		
-			close(data_socket);
-			exit(0);
-		}
-		printf("closing datasocket\n");
-		close(data_socket);
-		printf("closing datalistener\n");
-		close(data_listener);	
-		return;
-	}	
-}
-
-void sendFile(char dataPort[6], char fileName[128]){
-
-	FILE *fp;
-	
-	
-	printf("\nInside sendFile\n");
-	
-	fp = fopen(fileName, "r");
-	
-	if (fp == NULL){
-		printf("Can't open file %s", fileName);
-		exit(1);
-	}
-	
-	printf("\nattempting send\n");
-	/* TODO: Actually send the listing*/
-	
-	//open socket for data connection and accept
-	int data_listener = startServer(dataPort);
-	int data_socket;
-	struct sockaddr_storage client_addr;
-	socklen_t sin_size;	
-	
-	printf("Server: attempting to establish data connection on port %s\n", dataPort);
-	//main listen loop
-	while(1) {
-		printf("danger\n");
-		sin_size = sizeof client_addr;
-		printf("danger\n");
-		data_socket = accept(data_listener, (struct sockaddr *)&client_addr, &sin_size);
-		printf("danger\n");
-		if(data_socket == -1){
-			perror("accept");
-			continue;
-		}
-		
-		printf("Server: data connection established. Sending data...\n");
-		if(!fork()){
-			close(data_listener);
-			printf("What's going on?\n");
-		// if(send(data_socket, dirList, sizeof dirList, 0) != 0)
-			// perror("send");
-		
-			close(data_socket);
-			exit(0);
-		}
-		close(data_socket);
-		close(data_listener);			
-		return;
-	}	
-
-}
-
-bool fileExists(char *filename[], int filenameSize){
-	
-	/* TODO: check listing for provided filename*/
-	
-	return true;
-}
-
-int main(int argc, char *argv[]){
-	char portNum[6];
-	int listen_socket, control_socket;
-
-	
-	/* validate provided arguments before going any further	*/
-	if (argc != 2) {
-		fprintf(stderr, "\nExpected usage: ftpServer PORT\n\n");
-		exit(1);		
-	}
-	
-	if(*argv[1] > 65535){
-		fprintf(stderr, "\nInvalid PORT provided.\n\n");
-		exit(1);				
-	}
-	
-	/* copy args into variables */
-	strcpy(portNum, argv[1]);
-
-
-	listen_socket = startServer(portNum);
-	runServer(listen_socket, control_socket);
-	
-	
-}
-
