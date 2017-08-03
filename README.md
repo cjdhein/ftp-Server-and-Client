@@ -38,7 +38,7 @@ This will create a Java class file that can be executed.
 
 **********************
 # How To Use The Program
-**********************
+
 
 ## 1) Start the Server
 ____________________________________________________________________________________________________________
